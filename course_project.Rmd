@@ -1,0 +1,189 @@
+---
+title: "Project Report"
+subtitle: "Practical Machine Learning"
+date: "29-03-2022" 
+output: html_document
+---
+
+```{r general parameters, echo = FALSE}
+# Some general settings for the .html.
+
+knitr::opts_chunk$set(
+  echo = TRUE, # code is shown in document 
+  warning = FALSE, # excludes warning messages to be displayed
+  message = FALSE, # excludes messages to be displayed
+  # set figure size and position
+  fig.align = 'center',
+  fig.asp = 0.618,
+  fig.width = 8.6,
+  out.width='100%'
+)
+
+```
+
+```{r load packages, include = FALSE}
+library(magrittr)
+library(data.table)
+library(caret)
+library(foreach)
+library(doFuture)
+
+ProjectFolder = here::here()
+```
+
+```{r}
+### load datasets
+
+building = read.csv(paste0(ProjectFolder,"/pml-training.csv")) %>% as.data.table
+validating = read.csv(paste0(ProjectFolder,"/pml-testing.csv")) %>% as.data.table
+
+building[, classe := as.factor(classe)]
+```
+
+```{r}
+### set seed and flags
+
+set.seed(184)
+
+runCV = FALSE
+writeCSV = FALSE
+```
+
+```{r}
+### clean (building) dataset
+
+# remove columns which includes NA
+colsToDrop <- building %>% dplyr::select_if(~ any(is.na(.))) %>% names()
+build_clean <- building[, (colsToDrop) := NULL]
+
+# remove columns with constant values
+build_clean <- janitor::remove_constant(build_clean)
+
+# remove columns including "#DIV/0!"
+prop_DIV0 <- sapply(build_clean, function(x) length(x[x == "#DIV/0!"])/length(x))
+colsToDrop <- data.table(cols = names(prop_DIV0),
+                         prop = prop_DIV0)[prop > 0]$cols
+build_clean <- build_clean[, (colsToDrop) := NULL]
+```
+
+```{r, results = FALSE}
+### some basic data checks
+
+# check uniqueness of classe by user_name
+build_clean[,.(No = uniqueN(classe)), by = user_name][No > 1]
+#    user_name No
+# 1:  carlitos  5
+# 2:     pedro  5
+# 3:    adelmo  5
+# 4:   charles  5
+# 5:    eurico  5
+# 6:    jeremy  5
+
+# number of total user_name
+build_clean[,uniqueN(user_name)] # 6
+
+# remove columns over which we do not want to train our models
+colsToDrop = c("X","user_name","raw_timestamp_part_1","raw_timestamp_part_2",
+               "cvtd_timestamp","new_window","num_window")
+build_clean <- build_clean[, (colsToDrop) := NULL]
+```
+
+```{r}
+### perform Cross-Validation to identify best model
+
+if(runCV){
+
+  # register the cluster for parallel computation
+  registerDoFuture()
+  plan(multisession, workers = 3)
+  
+  # define folds
+  nFolds = 5
+  build_clean[, fold := sample(1:nFolds, 1, replace=TRUE), by = X]
+  
+  # define function to calculate accuracy on the test-subset given a model
+  calcAccuracy <- function(model, dt_test){
+    
+    accuracy <- confusionMatrix(predict(model,dt_test),dt_test$classe)$overall[1]
+    return(accuracy)
+    
+  }
+  
+  # define models-vector
+  models <- c("rpart","rf","gbm")
+  
+  # perform Cross-Validation
+  CV_results <- NULL
+  for(j in 1:length(models)){
+    
+    print(paste0("validating model: ",models[j]))
+  
+    # perform CV for a single model
+    CV_results_model <- NULL
+    CV_results_model <- 
+      foreach(CVfold = 1:nFolds,.combine = rbind) %dopar% {
+  
+        # set seed
+        set.seed(CVfold)
+        
+        # split test/train
+        train <- build_clean[fold != CVfold]
+        test <- build_clean[fold == CVfold]
+        
+        # train model
+        if(models[j] != "gbm"){
+          mod <- train(classe ~ ., method = models[j], data = train)
+        } else {
+          mod <- train(classe ~ ., method = models[j], data = train, verbose = FALSE)
+        }
+        
+        # calculate accuracy on test subset
+        calcAccuracy(mod, test)
+      }
+    
+    # store mean(accuracy) over nFolds
+    CV_results <- rbind(CV_results,
+                        data.table(model = models[j],
+                                   accuracy = mean(CV_results_model))
+                        )
+    
+  }
+  
+  # identify model with highest accuracy
+  CV_results[which.max(accuracy)]
+  #    model  accuracy
+  # 1:    rf 0.9941807
+  
+  CV_results
+  #    model  accuracy
+  # 1: rpart 0.5036492
+  # 2:    rf 0.9941807
+  # 3:   gbm 0.9605092
+
+}
+```
+
+```{r}
+### Model Fitting
+
+# fit the best model on the whole training dataset
+modBest <- train(classe ~ ., method = 'rf', data = build_clean)
+
+modBest
+
+results <- data.table(predictor = rownames(varImp(modBest)$importance),
+                      importance = varImp(modBest)$importance$Overall)
+
+results[order(-importance)][1:10]
+```
+
+```{r}
+### Predict on validating dataset and export results
+
+validating$classe <- predict(modBest,validating)
+
+if(writeCSV){
+  write.csv(validating, file = paste0(ProjectFolder,"/pml-prediction.csv"))
+}
+```
+
